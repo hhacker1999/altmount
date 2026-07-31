@@ -28,6 +28,10 @@ const (
 	// deep watermark prefetch is allowed to consume connections. ~24MB ≈ a
 	// few seconds of remux — prioritizes TTFB and seek recovery over deep fill.
 	urgentAheadBytes = 24 * 1024 * 1024
+	// headOfLineInflight caps concurrent downloads until the segment at the
+	// current read cursor is ready. Prevents launching dozens of articles
+	// before the player can receive the first byte.
+	headOfLineInflight = 8
 )
 
 var (
@@ -572,10 +576,9 @@ func (b *UsenetReader) downloadSegmentWithRetry(ctx context.Context, seg *segmen
 		retry.Context(ctx),
 	)
 
-	// Cache WRITE: tee-write after successful download (fire-and-forget)
-	if b.segmentStore != nil && resultBytes != nil && err == nil {
-		_ = b.segmentStore.Put(seg.Id, resultBytes)
-	}
+	// Segment cache writes happen AFTER SetData in the download task so disk
+	// I/O cannot delay unblocking the reader (TTFB). Put is intentionally
+	// not done here.
 
 	if errors.Is(err, nntppool.ErrArticleNotFound) {
 		b.log.DebugContext(ctx, "missing segment",
@@ -634,6 +637,7 @@ func (b *UsenetReader) downloadManager(ctx context.Context) {
 
 		if b.aggressive && b.highWatermarkBytes > 0 {
 			aheadBytes := b.aheadBytesLocked(currentRead, b.nextToDownload)
+			inFlightNow := int(b.inFlight.Load())
 
 			if b.waitingForLowWatermark {
 				if aheadBytes > b.lowWatermarkBytes {
@@ -657,8 +661,20 @@ func (b *UsenetReader) downloadManager(ctx context.Context) {
 				continue
 			}
 
+			// Head-of-line: until the segment the player is waiting on is
+			// ready, keep concurrency tiny so pool slots go to TTFB.
+			if cur, err := b.rg.GetSegment(currentRead); err == nil && cur != nil && !cur.IsReady() {
+				if inFlightNow >= headOfLineInflight {
+					b.cond.Wait()
+					b.mu.Unlock()
+					if ctx.Err() != nil {
+						return
+					}
+					continue
+				}
+			}
+
 			urgentEnd := b.urgentEndIndexLocked(currentRead, totalSegments)
-			inFlightNow := int(b.inFlight.Load())
 
 			// Deep fill (past the urgent near-cursor window) only after the
 			// urgent window is ready — otherwise seeks/playback starve while
@@ -743,8 +759,17 @@ func (b *UsenetReader) downloadManager(ctx context.Context) {
 					return
 				}
 				s.SetError(err)
-			} else {
-				s.SetData(data)
+				return
+			}
+
+			// Unblock readers BEFORE disk cache write. Synchronous Put was
+			// delaying TTFB under load (NNTP saturated, player at 0 B/s).
+			s.SetData(data)
+			if b.segmentStore != nil {
+				id, payload := s.Id, data
+				go func() {
+					_ = b.segmentStore.Put(id, payload)
+				}()
 			}
 		}(idx, seg)
 	}

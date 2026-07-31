@@ -1067,28 +1067,46 @@ func (mvf *MetadataVirtualFile) Read(p []byte) (n int, err error) {
 			return n, err
 		}
 
-		totalRead, readErr := mvf.reader.Read(p[n:])
+		reader := mvf.reader
+		streamID := mvf.streamID
+		tracker := mvf.streamTracker
+		bufOff := mvf.bufOffReader
+
+		// Release the file lock while blocked on NNTP/segment data so Seek/Close
+		// can interrupt and so concurrent handles are not serialized behind TTFB.
+		mvf.mu.Unlock()
+		totalRead, readErr := reader.Read(p[n:])
+		mvf.mu.Lock()
+
+		if mvf.meta == nil {
+			return n, ErrFileClosed
+		}
+		// Seek/Close replaced the reader while we were blocked — discard
+		// stale bytes and retry against the new pipeline.
+		if mvf.reader != reader {
+			if n > 0 {
+				return n, nil
+			}
+			continue
+		}
+
 		n += totalRead
 		mvf.position += int64(totalRead)
 
-		if totalRead > 0 && mvf.streamTracker != nil && mvf.streamID != "" {
-			mvf.streamTracker.UpdateProgress(mvf.streamID, int64(totalRead))
-			mvf.streamTracker.UpdateCurrentOffset(mvf.streamID, mvf.position)
-
-			// Update buffered offset if available
-			if mvf.bufOffReader != nil {
-				mvf.streamTracker.UpdateBufferedOffset(mvf.streamID, mvf.bufOffReader.GetBufferedOffset())
+		if totalRead > 0 && tracker != nil && streamID != "" {
+			tracker.UpdateProgress(streamID, int64(totalRead))
+			tracker.UpdateCurrentOffset(streamID, mvf.position)
+			if bufOff != nil {
+				tracker.UpdateBufferedOffset(streamID, bufOff.GetBufferedOffset())
 			}
 		}
 
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) && mvf.hasMoreDataToRead() {
-				// Close current reader and try to get a new one for the next range in next iteration
 				mvf.closeCurrentReader()
 				continue
 			}
 
-			// For data corruption errors, report and mark as corrupted
 			var dataCorruptionErr *usenet.DataCorruptionError
 			if errors.As(readErr, &dataCorruptionErr) {
 				mvf.updateFileHealthOnError(dataCorruptionErr, dataCorruptionErr.NoRetry)
@@ -1185,14 +1203,34 @@ func (mvf *MetadataVirtualFile) ReadAtContext(readCtx context.Context, p []byte,
 		}
 		buf := p[:want]
 		for n < int(want) {
-			rn, readErr := mvf.reader.Read(buf[n:])
+			reader := mvf.reader
+			streamID := mvf.streamID
+			tracker := mvf.streamTracker
+			bufOff := mvf.bufOffReader
+
+			mvf.mu.Unlock()
+			rn, readErr := reader.Read(buf[n:])
+			mvf.mu.Lock()
+
+			if mvf.meta == nil {
+				return n, ErrFileClosed
+			}
+			if mvf.reader != reader {
+				if n > 0 {
+					mvf.readAtSharedNext = off + int64(n)
+					return n, nil
+				}
+				mvf.readAtSharedNext = -1
+				goto ephemeral
+			}
+
 			n += rn
 
-			if n > 0 && mvf.streamTracker != nil && mvf.streamID != "" {
-				mvf.streamTracker.UpdateProgress(mvf.streamID, int64(rn))
-				mvf.streamTracker.UpdateCurrentOffset(mvf.streamID, off+int64(n))
-				if mvf.bufOffReader != nil {
-					mvf.streamTracker.UpdateBufferedOffset(mvf.streamID, mvf.bufOffReader.GetBufferedOffset())
+			if rn > 0 && tracker != nil && streamID != "" {
+				tracker.UpdateProgress(streamID, int64(rn))
+				tracker.UpdateCurrentOffset(streamID, off+int64(n))
+				if bufOff != nil {
+					tracker.UpdateBufferedOffset(streamID, bufOff.GetBufferedOffset())
 				}
 			}
 
