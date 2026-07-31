@@ -117,6 +117,9 @@ func (m *Manager) performMount(ctx context.Context, provider, mountPath, webdavU
 	if cfg.RClone.BufferSize != "" {
 		configOpts["BufferSize"] = cfg.RClone.BufferSize
 	}
+	if cfg.RClone.Transfers > 0 {
+		configOpts["Transfers"] = cfg.RClone.Transfers
+	}
 
 	if len(configOpts) > 0 {
 		// Only add _config if there are options to set
@@ -152,11 +155,22 @@ func (m *Manager) performMount(ctx context.Context, provider, mountPath, webdavU
 		if cfg.RClone.VFSReadAhead != "" {
 			vfsOpt["ReadAhead"] = cfg.RClone.VFSReadAhead
 		}
+		if cfg.RClone.VFSReadChunkStreams > 0 {
+			vfsOpt["ChunkStreams"] = cfg.RClone.VFSReadChunkStreams
+		}
+		if cfg.RClone.DirCacheTime != "" {
+			if d, e := time.ParseDuration(cfg.RClone.DirCacheTime); e == nil {
+				vfsOpt["DirCacheTime"] = d.Nanoseconds()
+			}
+		}
 		if cfg.RClone.NoChecksum {
 			vfsOpt["NoChecksum"] = cfg.RClone.NoChecksum
 		}
 		if cfg.RClone.NoModTime {
 			vfsOpt["NoModTime"] = cfg.RClone.NoModTime
+		}
+		if cfg.RClone.VFSFastFingerprint {
+			vfsOpt["FastFingerprint"] = true
 		}
 	}
 
@@ -172,6 +186,8 @@ func (m *Manager) performMount(ctx context.Context, provider, mountPath, webdavU
 			mountOpt["AttrTimeout"] = attrTimeout.Nanoseconds()
 		}
 	}
+	// AsyncRead is a FUSE mount option (not VFS).
+	mountOpt["AsyncRead"] = cfg.RClone.AsyncRead
 
 	// Merge custom mount options (can override any of the above)
 	for k, v := range cfg.RClone.MountOptions {

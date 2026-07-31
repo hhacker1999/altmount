@@ -93,6 +93,10 @@ type Manager interface {
 	// NotifyStreamChange must be called by the stream source whenever its
 	// active stream count changes, so the budget can re-evaluate.
 	NotifyStreamChange()
+
+	// SetPauseImportsWhileStreaming toggles whether import body fetches are
+	// fully paused while any stream is active.
+	SetPauseImportsWhileStreaming(pause bool)
 }
 
 // StatsRepository defines the interface for persisting pool statistics
@@ -522,6 +526,12 @@ func (m *manager) SetStreamSource(src StreamActivitySource) {
 // budget so it can wake or hold waiters according to the new effective cap.
 func (m *manager) NotifyStreamChange() {
 	m.budget.NotifyStreamChange()
+}
+
+// SetPauseImportsWhileStreaming toggles full pause of import body fetches
+// while streams are active.
+func (m *manager) SetPauseImportsWhileStreaming(pause bool) {
+	m.budget.SetPauseImportsWhileStreaming(pause)
 }
 
 // SetProviderIDs sets a mapping between pool names and configuration IDs

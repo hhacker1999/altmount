@@ -8,6 +8,7 @@ import (
 
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
 	"github.com/javi11/altmount/internal/pool"
+	"github.com/javi11/altmount/internal/utils"
 	"github.com/javi11/nntppool/v4"
 )
 
@@ -462,10 +463,10 @@ func (m *mockPoolManager) ImportConnCapacity() int     { return 0 }
 func (m *mockPoolManager) SetStreamSource(_ pool.StreamActivitySource) {}
 
 func (m *mockPoolManager) NotifyStreamChange() {}
+func (m *mockPoolManager) SetPauseImportsWhileStreaming(bool) {}
 
-// TestSeekResetsOriginalRangeEnd tests that Seek properly resets originalRangeEnd
-// This is critical for video playback - without this fix, seeking causes stale range
-// information to be reused, breaking subsequent reads
+// TestSeekResetsOriginalRangeEnd tests that Seek clears the HTTP Range bind so
+// the next reader opens at the seek target, not the original Range start.
 func TestSeekResetsOriginalRangeEnd(t *testing.T) {
 	fileSize := int64(100 * 1024 * 1024) // 100MB
 	mvf := &MetadataVirtualFile{
@@ -474,10 +475,10 @@ func TestSeekResetsOriginalRangeEnd(t *testing.T) {
 		},
 		position:          0,
 		originalRangeEnd:  -1, // Simulate unbounded range from initial HTTP request
+		httpRangeConsumed: true,
 		readerInitialized: false,
 	}
 
-	// Seek to a new position - this should reset originalRangeEnd
 	newPos, err := mvf.Seek(1024*1024, io.SeekStart) // Seek to 1MB
 	if err != nil {
 		t.Fatalf("Seek() error = %v", err)
@@ -486,9 +487,12 @@ func TestSeekResetsOriginalRangeEnd(t *testing.T) {
 		t.Errorf("Seek() returned position = %d, want %d", newPos, 1024*1024)
 	}
 
-	// originalRangeEnd should be reset to 0 (not -1) to force fresh range calculation
-	if mvf.originalRangeEnd != 0 {
-		t.Errorf("After Seek(), originalRangeEnd = %d, want 0 (reset)", mvf.originalRangeEnd)
+	// After Seek, continue unbounded from the new position (not re-bind HTTP Range).
+	if mvf.originalRangeEnd != -1 {
+		t.Errorf("After Seek(), originalRangeEnd = %d, want -1 (unbounded from seek)", mvf.originalRangeEnd)
+	}
+	if !mvf.httpRangeConsumed {
+		t.Error("After Seek(), httpRangeConsumed should stay true so Range header is not re-applied")
 	}
 }
 
@@ -543,9 +547,8 @@ func TestMultipleConsecutiveSeeks(t *testing.T) {
 			t.Errorf("After Seek(%d), position = %d", targetPos, mvf.position)
 		}
 
-		// originalRangeEnd should be reset after each seek (except when position unchanged)
-		if mvf.originalRangeEnd != 0 {
-			t.Errorf("After Seek(%d), originalRangeEnd = %d, want 0", targetPos, mvf.originalRangeEnd)
+		if mvf.originalRangeEnd != -1 {
+			t.Errorf("After Seek(%d), originalRangeEnd = %d, want -1", targetPos, mvf.originalRangeEnd)
 		}
 	}
 }
@@ -604,11 +607,41 @@ func TestSeekWithWhenceModes(t *testing.T) {
 				t.Errorf("Seek() position = %d, want %d", newPos, tt.expectedPos)
 			}
 
-			// originalRangeEnd should be reset
-			if mvf.originalRangeEnd != 0 {
-				t.Errorf("originalRangeEnd = %d, want 0", mvf.originalRangeEnd)
+			if mvf.originalRangeEnd != -1 {
+				t.Errorf("originalRangeEnd = %d, want -1", mvf.originalRangeEnd)
 			}
 		})
+	}
+}
+
+// TestSeekDoesNotReplayHTTPRangeStart is the regression for playback seeks:
+// after Seek, getRequestRange must return the seek target even when the
+// request context still carries the original Range: bytes=0- header.
+func TestSeekDoesNotReplayHTTPRangeStart(t *testing.T) {
+	fileSize := int64(100 * 1024 * 1024)
+	ctx := context.WithValue(context.Background(), utils.RangeKey, "bytes=0-")
+	mvf := &MetadataVirtualFile{
+		meta: &fileHandleMeta{
+			FileSize: fileSize,
+		},
+		ctx:               ctx,
+		position:          0,
+		originalRangeEnd:  -1,
+		httpRangeConsumed: true, // already applied at open
+		readerInitialized: false,
+	}
+
+	const seekTo = int64(50 * 1024 * 1024)
+	if _, err := mvf.Seek(seekTo, io.SeekStart); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+
+	start, end := mvf.getRequestRange()
+	if start != seekTo {
+		t.Fatalf("getRequestRange start = %d, want %d (must not replay Range start=0)", start, seekTo)
+	}
+	if end != -1 {
+		t.Fatalf("getRequestRange end = %d, want -1 (unbounded after seek)", end)
 	}
 }
 

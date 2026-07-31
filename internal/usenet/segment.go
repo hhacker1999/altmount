@@ -285,6 +285,19 @@ func (s *segment) DataLen() int {
 	return len(s.data)
 }
 
+// IsReady reports whether the segment download has finished (data or error).
+func (s *segment) IsReady() bool {
+	if s == nil {
+		return true
+	}
+	select {
+	case <-s.dataReady:
+		return true
+	default:
+		return false
+	}
+}
+
 // GetReaderContext returns a reader for the segment data.
 // Blocks until data is available, an error is set, or the context is cancelled.
 // The reader is limited to the range [Start, End] within the segment.

@@ -234,3 +234,4 @@ func (m *validationTestPoolManager) SetImportConnCapacity(_ int)                
 func (m *validationTestPoolManager) ImportConnCapacity() int                     { return 0 }
 func (m *validationTestPoolManager) SetStreamSource(_ pool.StreamActivitySource) {}
 func (m *validationTestPoolManager) NotifyStreamChange()                         {}
+func (m *validationTestPoolManager) SetPauseImportsWhileStreaming(bool) {}

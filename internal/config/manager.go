@@ -228,6 +228,25 @@ type FailureMaskingConfig struct {
 type StreamingConfig struct {
 	MaxPrefetch    int                  `yaml:"max_prefetch" mapstructure:"max_prefetch" json:"max_prefetch"`
 	FailureMasking FailureMaskingConfig `yaml:"failure_masking" mapstructure:"failure_masking" json:"failure_masking"`
+
+	// AggressiveStreaming keeps NNTP downloads in flight until a RAM byte
+	// watermark is reached, so playback saturates provider connections instead
+	// of idling after a short segment window fills. When false (default), only
+	// MaxPrefetch segment-count limiting is used (legacy behavior).
+	AggressiveStreaming *bool `yaml:"aggressive_streaming" mapstructure:"aggressive_streaming" json:"aggressive_streaming"`
+	// PrefetchWatermarkMB is the high watermark of unread ahead data held in
+	// RAM per stream (decoded segment bytes). Downloads pause at this size.
+	PrefetchWatermarkMB int `yaml:"prefetch_watermark_mb" mapstructure:"prefetch_watermark_mb" json:"prefetch_watermark_mb"`
+	// PrefetchLowWatermarkMB resumes aggressive downloading when buffered
+	// unread data falls below this size. Must be < PrefetchWatermarkMB.
+	PrefetchLowWatermarkMB int `yaml:"prefetch_low_watermark_mb" mapstructure:"prefetch_low_watermark_mb" json:"prefetch_low_watermark_mb"`
+	// MaxInflightSegments caps concurrent segment downloads per stream while
+	// filling toward the high watermark. Higher values saturate more
+	// connections; 0 defaults to MaxPrefetch.
+	MaxInflightSegments int `yaml:"max_inflight_segments" mapstructure:"max_inflight_segments" json:"max_inflight_segments"`
+	// PauseImportsWhileStreaming, when true, stops import segment fetches
+	// while any stream is active so playback gets the full connection pool.
+	PauseImportsWhileStreaming *bool `yaml:"pause_imports_while_streaming" mapstructure:"pause_imports_while_streaming" json:"pause_imports_while_streaming"`
 }
 
 // RCloneConfig represents rclone configuration
@@ -663,6 +682,34 @@ func (c *Config) Validate() error {
 
 	if c.Streaming.MaxPrefetch <= 0 {
 		c.Streaming.MaxPrefetch = 60 // Default to 60 segments prefetched ahead if not set
+	}
+	if c.Streaming.MaxPrefetch > 500 {
+		c.Streaming.MaxPrefetch = 500
+	}
+	if c.Streaming.PrefetchWatermarkMB <= 0 {
+		c.Streaming.PrefetchWatermarkMB = 256
+	}
+	if c.Streaming.PrefetchWatermarkMB > 4096 {
+		c.Streaming.PrefetchWatermarkMB = 4096
+	}
+	if c.Streaming.PrefetchLowWatermarkMB <= 0 {
+		// Default low watermark to half of high (at least 64 MB).
+		c.Streaming.PrefetchLowWatermarkMB = c.Streaming.PrefetchWatermarkMB / 2
+		if c.Streaming.PrefetchLowWatermarkMB < 64 {
+			c.Streaming.PrefetchLowWatermarkMB = 64
+		}
+	}
+	if c.Streaming.PrefetchLowWatermarkMB >= c.Streaming.PrefetchWatermarkMB {
+		c.Streaming.PrefetchLowWatermarkMB = c.Streaming.PrefetchWatermarkMB / 2
+		if c.Streaming.PrefetchLowWatermarkMB < 1 {
+			c.Streaming.PrefetchLowWatermarkMB = 1
+		}
+	}
+	if c.Streaming.MaxInflightSegments < 0 {
+		c.Streaming.MaxInflightSegments = 0
+	}
+	if c.Streaming.MaxInflightSegments > 500 {
+		c.Streaming.MaxInflightSegments = 500
 	}
 
 	// Segment cache expiry: nil (unset) defaults to 24 hours; an explicit 0 is
@@ -1485,6 +1532,8 @@ func DefaultConfig(configDir ...string) *Config {
 	failureMaskingEnabled := false
 	repairEnabled := true
 	repairExponentialBackoff := true
+	aggressiveStreaming := false
+	pauseImportsWhileStreaming := false
 
 	// Set paths based on whether we're running in Docker or have a specific config directory
 	var dbPath, metadataPath, logPath, rclonePath, cachePath, backupPath string
@@ -1549,7 +1598,12 @@ func DefaultConfig(configDir ...string) *Config {
 			},
 		},
 		Streaming: StreamingConfig{
-			MaxPrefetch: 60, // Default: 60 segments prefetched ahead
+			MaxPrefetch:                60, // Default: 60 segments prefetched ahead
+			AggressiveStreaming:        &aggressiveStreaming,
+			PrefetchWatermarkMB:        256, // RAM ahead per stream when aggressive
+			PrefetchLowWatermarkMB:     128,
+			MaxInflightSegments:        32, // saturate without starving seeks / multi-Range GETs
+			PauseImportsWhileStreaming: &pauseImportsWhileStreaming,
 			FailureMasking: FailureMaskingConfig{
 				Enabled:   &failureMaskingEnabled,
 				Threshold: 3,

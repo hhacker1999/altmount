@@ -2,6 +2,8 @@ package pool
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 )
 
 // streamHeadroom is how many connections are set aside per active stream when
@@ -23,10 +25,21 @@ const streamHeadroom = 2
 // under playback, and always keep at least 1 connection so a lone import can
 // make progress. A capacity of 0 disables the budget (no-op), which keeps
 // pool-less paths and test fakes deadlock-free.
+//
+// When pauseImportsWhileStreaming is set and any stream is active, Acquire
+// blocks (separate from the semaphore) until streams finish — semaphore cap 0
+// means "unlimited", so pause cannot reuse that sentinel.
 type ImportBudget struct {
 	sem          adaptiveSemaphore
 	capacity     int
 	streamSource StreamActivitySource
+	// pauseImportsWhileStreaming, when true, blocks import Acquires while
+	// ActiveStreams() > 0 so playback can saturate the pool.
+	pauseImportsWhileStreaming atomic.Bool
+
+	// pauseMu / pauseCond wake Acquires waiting on the pause gate.
+	pauseMu   sync.Mutex
+	pauseCond *sync.Cond
 }
 
 // NewImportBudget constructs a budget with capacity 0 (disabled). Use
@@ -34,6 +47,7 @@ type ImportBudget struct {
 func NewImportBudget() *ImportBudget {
 	b := &ImportBudget{}
 	b.sem.capLocked = b.effectiveCapLocked
+	b.pauseCond = sync.NewCond(&b.pauseMu)
 	return b
 }
 
@@ -50,6 +64,18 @@ func (b *ImportBudget) effectiveCapLocked() int {
 		reserve = b.capacity - 1
 	}
 	return b.capacity - reserve
+}
+
+// SetPauseImportsWhileStreaming toggles whether import segment fetches are
+// fully paused while any stream is active.
+func (b *ImportBudget) SetPauseImportsWhileStreaming(pause bool) {
+	b.pauseImportsWhileStreaming.Store(pause)
+	b.pauseMu.Lock()
+	b.pauseCond.Broadcast()
+	b.pauseMu.Unlock()
+	b.sem.mu.Lock()
+	b.sem.wakeWaitersLocked()
+	b.sem.mu.Unlock()
 }
 
 // SetCapacity updates the total connection capacity (sum of provider
@@ -80,6 +106,9 @@ func (b *ImportBudget) SetStreamSource(src StreamActivitySource) {
 	b.streamSource = src
 	b.sem.wakeWaitersLocked()
 	b.sem.mu.Unlock()
+	b.pauseMu.Lock()
+	b.pauseCond.Broadcast()
+	b.pauseMu.Unlock()
 }
 
 // NotifyStreamChange should be called when the stream count changes so the
@@ -88,11 +117,59 @@ func (b *ImportBudget) NotifyStreamChange() {
 	b.sem.mu.Lock()
 	b.sem.wakeWaitersLocked()
 	b.sem.mu.Unlock()
+	b.pauseMu.Lock()
+	b.pauseCond.Broadcast()
+	b.pauseMu.Unlock()
+}
+
+// importsPaused reports whether Acquire should block on the pause gate.
+func (b *ImportBudget) importsPaused() bool {
+	if !b.pauseImportsWhileStreaming.Load() {
+		return false
+	}
+	if b.streamSource == nil {
+		return false
+	}
+	return b.streamSource.ActiveStreams() > 0
 }
 
 // Acquire blocks until a connection token is available or ctx is cancelled.
 // The returned release function MUST be called exactly once when the fetch is
 // done. When the capacity is 0 the call is a fast-path no-op.
 func (b *ImportBudget) Acquire(ctx context.Context) (release func(), err error) {
+	if err := b.waitWhileImportsPaused(ctx); err != nil {
+		return noopRelease, err
+	}
 	return b.sem.Acquire(ctx)
+}
+
+// waitWhileImportsPaused blocks while pause-imports is enabled and streams
+// are active. Uses a condvar woken by NotifyStreamChange / SetPause*.
+func (b *ImportBudget) waitWhileImportsPaused(ctx context.Context) error {
+	if !b.importsPaused() {
+		return nil
+	}
+
+	// Wake the cond when ctx is cancelled.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			b.pauseMu.Lock()
+			b.pauseCond.Broadcast()
+			b.pauseMu.Unlock()
+		case <-done:
+		}
+	}()
+
+	b.pauseMu.Lock()
+	defer b.pauseMu.Unlock()
+	for b.importsPaused() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		b.pauseCond.Wait()
+	}
+	return ctx.Err()
 }

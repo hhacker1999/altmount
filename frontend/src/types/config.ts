@@ -90,6 +90,16 @@ export interface FailureMaskingConfig {
 export interface StreamingConfig {
 	max_prefetch: number;
 	failure_masking: FailureMaskingConfig;
+	/** Keep NNTP saturated until RAM watermark is reached (per stream). */
+	aggressive_streaming?: boolean | null;
+	/** High watermark of unread ahead data in RAM (MB) when aggressive. */
+	prefetch_watermark_mb?: number;
+	/** Resume downloading when unread ahead falls below this (MB). */
+	prefetch_low_watermark_mb?: number;
+	/** Max concurrent segment downloads per stream while filling watermark. */
+	max_inflight_segments?: number;
+	/** Block import NNTP fetches while any stream is active. */
+	pause_imports_while_streaming?: boolean | null;
 }
 
 // Segment cache configuration
@@ -382,6 +392,11 @@ export interface MetadataUpdateRequest {
 export interface StreamingUpdateRequest {
 	max_prefetch?: number;
 	failure_masking?: Partial<FailureMaskingConfig>;
+	aggressive_streaming?: boolean | null;
+	prefetch_watermark_mb?: number;
+	prefetch_low_watermark_mb?: number;
+	max_inflight_segments?: number;
+	pause_imports_while_streaming?: boolean | null;
 }
 
 // Health update request

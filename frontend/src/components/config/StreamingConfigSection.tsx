@@ -1,6 +1,11 @@
 import { Info, Save } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { ConfigResponse, SegmentCacheConfig, StreamingConfig } from "../../types/config";
+import type {
+	ConfigResponse,
+	FailureMaskingConfig,
+	SegmentCacheConfig,
+	StreamingConfig,
+} from "../../types/config";
 
 interface StreamingConfigSectionProps {
 	config: ConfigResponse;
@@ -32,7 +37,10 @@ export function StreamingConfigSection({
 		setHasChanges(streamingChanged || cacheChanged);
 	};
 
-	const handleStreamingChange = (field: keyof StreamingConfig, value: number) => {
+	const handleStreamingChange = (
+		field: keyof StreamingConfig,
+		value: number | boolean | FailureMaskingConfig,
+	) => {
 		const newData = { ...streamingData, [field]: value };
 		setStreamingData(newData);
 		checkChanges(newData, cacheData);
@@ -70,13 +78,181 @@ export function StreamingConfigSection({
 			</div>
 
 			<div className="space-y-8">
+				{/* Aggressive streaming */}
+				<div className="flex items-center justify-between rounded-2xl border-2 border-base-300/80 bg-base-200/60 p-6">
+					<div className="min-w-0 pr-4">
+						<h4 className="font-bold text-base-content text-sm">Aggressive Streaming</h4>
+						<p className="mt-1 break-words text-[11px] text-base-content/50 leading-relaxed">
+							Keep NNTP connections saturated until a RAM high-watermark of unread data is
+							buffered ahead of playback. Recommended for high-bitrate remuxes. Uses more
+							memory per active stream; pair with segment cache on SSD for seeks/rewatch.
+						</p>
+					</div>
+					<input
+						type="checkbox"
+						className="toggle toggle-primary shrink-0"
+						checked={streamingData.aggressive_streaming === true}
+						disabled={isReadOnly}
+						onChange={(e) => handleStreamingChange("aggressive_streaming", e.target.checked)}
+					/>
+				</div>
+
+				{streamingData.aggressive_streaming === true && (
+					<>
+						{/* High watermark */}
+						<div className="fade-in slide-in-from-top-2 animate-in space-y-6 rounded-2xl border-2 border-base-300/80 bg-base-200/60 p-6">
+							<div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+								<div className="min-w-0">
+									<h4 className="font-bold text-base-content text-sm">RAM High Watermark</h4>
+									<p className="mt-1 break-words text-[11px] text-base-content/50 leading-relaxed">
+										Pause NNTP downloads when this much unread data is buffered ahead per
+										stream.
+									</p>
+								</div>
+								<div className="flex shrink-0 items-center gap-3">
+									<span className="font-black font-mono text-primary text-xl">
+										{streamingData.prefetch_watermark_mb ?? 256}
+									</span>
+									<span className="font-bold text-base-content/60 text-xs uppercase">MB</span>
+								</div>
+							</div>
+							<input
+								type="range"
+								min="64"
+								max="2048"
+								value={streamingData.prefetch_watermark_mb ?? 256}
+								step="64"
+								className="range range-primary range-sm w-full [&::-webkit-slider-runnable-track]:rounded-full"
+								disabled={isReadOnly}
+								onChange={(e) =>
+									handleStreamingChange(
+										"prefetch_watermark_mb",
+										Number.parseInt(e.target.value, 10),
+									)
+								}
+							/>
+							<div className="flex justify-between px-2 font-black text-base-content/50 text-xs">
+								<span>64</span>
+								<span>512</span>
+								<span>1024</span>
+								<span>2048</span>
+							</div>
+						</div>
+
+						{/* Low watermark */}
+						<div className="fade-in slide-in-from-top-2 animate-in space-y-6 rounded-2xl border-2 border-base-300/80 bg-base-200/60 p-6">
+							<div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+								<div className="min-w-0">
+									<h4 className="font-bold text-base-content text-sm">RAM Low Watermark</h4>
+									<p className="mt-1 break-words text-[11px] text-base-content/50 leading-relaxed">
+										Resume saturating downloads when unread ahead falls below this size.
+									</p>
+								</div>
+								<div className="flex shrink-0 items-center gap-3">
+									<span className="font-black font-mono text-primary text-xl">
+										{streamingData.prefetch_low_watermark_mb ?? 128}
+									</span>
+									<span className="font-bold text-base-content/60 text-xs uppercase">MB</span>
+								</div>
+							</div>
+							<input
+								type="range"
+								min="32"
+								max="1024"
+								value={streamingData.prefetch_low_watermark_mb ?? 128}
+								step="32"
+								className="range range-primary range-sm w-full [&::-webkit-slider-runnable-track]:rounded-full"
+								disabled={isReadOnly}
+								onChange={(e) =>
+									handleStreamingChange(
+										"prefetch_low_watermark_mb",
+										Number.parseInt(e.target.value, 10),
+									)
+								}
+							/>
+							<div className="flex justify-between px-2 font-black text-base-content/50 text-xs">
+								<span>32</span>
+								<span>256</span>
+								<span>512</span>
+								<span>1024</span>
+							</div>
+						</div>
+
+						{/* Max inflight */}
+						<div className="fade-in slide-in-from-top-2 animate-in space-y-6 rounded-2xl border-2 border-base-300/80 bg-base-200/60 p-6">
+							<div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+								<div className="min-w-0">
+									<h4 className="font-bold text-base-content text-sm">Max Inflight Segments</h4>
+									<p className="mt-1 break-words text-[11px] text-base-content/50 leading-relaxed">
+										Concurrent article downloads near the playback cursor. Deep ahead-fill uses
+										a smaller share so seeks stay responsive. Match roughly to provider
+										connections (e.g. 20–40).
+									</p>
+								</div>
+								<div className="flex shrink-0 items-center gap-3">
+									<span className="font-black font-mono text-primary text-xl">
+										{streamingData.max_inflight_segments ?? 32}
+									</span>
+									<span className="font-bold text-base-content/60 text-xs uppercase">
+										segments
+									</span>
+								</div>
+							</div>
+							<input
+								type="range"
+								min="10"
+								max="200"
+								value={streamingData.max_inflight_segments ?? 32}
+								step="5"
+								className="range range-primary range-sm w-full [&::-webkit-slider-runnable-track]:rounded-full"
+								disabled={isReadOnly}
+								onChange={(e) =>
+									handleStreamingChange(
+										"max_inflight_segments",
+										Number.parseInt(e.target.value, 10),
+									)
+								}
+							/>
+							<div className="flex justify-between px-2 font-black text-base-content/50 text-xs">
+								<span>10</span>
+								<span>50</span>
+								<span>100</span>
+								<span>150</span>
+								<span>200</span>
+							</div>
+						</div>
+					</>
+				)}
+
+				{/* Pause imports */}
+				<div className="flex items-center justify-between rounded-2xl border-2 border-base-300/80 bg-base-200/60 p-6">
+					<div className="min-w-0 pr-4">
+						<h4 className="font-bold text-base-content text-sm">Pause Imports While Streaming</h4>
+						<p className="mt-1 break-words text-[11px] text-base-content/50 leading-relaxed">
+							Block import NNTP fetches while any stream is active so playback gets the full
+							connection pool.
+						</p>
+					</div>
+					<input
+						type="checkbox"
+						className="toggle toggle-primary shrink-0"
+						checked={streamingData.pause_imports_while_streaming === true}
+						disabled={isReadOnly}
+						onChange={(e) =>
+							handleStreamingChange("pause_imports_while_streaming", e.target.checked)
+						}
+					/>
+				</div>
+
 				{/* Prefetch Slider */}
 				<div className="space-y-6 rounded-2xl border-2 border-base-300/80 bg-base-200/60 p-6">
 					<div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
 						<div className="min-w-0">
 							<h4 className="font-bold text-base-content text-sm">Segment Prefetch</h4>
 							<p className="mt-1 break-words text-[11px] text-base-content/50 leading-relaxed">
-								Number of Usenet articles to download ahead of current playback position.
+								Legacy segment-count window ahead of playback. When aggressive streaming is
+								off, this is the only ahead limit. When aggressive is on, the RAM watermark
+								takes over and this acts as a safety bound.
 							</p>
 						</div>
 						<div className="flex shrink-0 items-center gap-3">
@@ -91,7 +267,7 @@ export function StreamingConfigSection({
 						<input
 							type="range"
 							min="1"
-							max="100"
+							max="500"
 							value={streamingData.max_prefetch}
 							step="1"
 							className="range range-primary range-sm w-full [&::-webkit-slider-runnable-track]:rounded-full"
@@ -102,11 +278,9 @@ export function StreamingConfigSection({
 						/>
 						<div className="flex justify-between px-2 font-black text-base-content/50 text-xs">
 							<span>1</span>
-							<span>20</span>
-							<span>40</span>
-							<span>60</span>
-							<span>80</span>
 							<span>100</span>
+							<span>250</span>
+							<span>500</span>
 						</div>
 					</div>
 				</div>
@@ -119,8 +293,9 @@ export function StreamingConfigSection({
 							Performance Note
 						</div>
 						<div className="mt-1 break-words text-[11px] leading-relaxed opacity-80">
-							Higher values improve stability on slow connections but increase initial memory usage.
-							Default (60) is recommended for most 4K streaming scenarios.
+							For remuxes: enable Aggressive Streaming (256–512 MB watermark), Segment Cache
+							on SSD, and Max Inflight around 20–40. Near-cursor data is filled first; deep
+							ahead-fill only runs after that window is ready so seeks stay responsive.
 						</div>
 					</div>
 				</div>

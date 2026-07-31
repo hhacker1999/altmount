@@ -20,6 +20,14 @@ import (
 
 const (
 	defaultMaxPrefetch = 60 // Default to 60 segments prefetched ahead
+	// defaultAggressiveMaxInflight is used when aggressive mode is on and
+	// MaxInflightSegments is unset. Kept moderate so a single stream cannot
+	// monopolize the pool when rclone opens multiple Range GETs.
+	defaultAggressiveMaxInflight = 32
+	// urgentAheadBytes is the near-cursor window that must stay filled before
+	// deep watermark prefetch is allowed to consume connections. ~24MB ≈ a
+	// few seconds of remux — prioritizes TTFB and seek recovery over deep fill.
+	urgentAheadBytes = 24 * 1024 * 1024
 )
 
 var (
@@ -70,6 +78,33 @@ func WithHoleHooks(h *HoleHooks) ReaderOption {
 // Implemented by pool.Manager (AcquireImportConnection).
 type ConnBudget interface {
 	AcquireImportConnection(ctx context.Context) (release func(), err error)
+}
+
+// PrefetchConfig controls how far ahead a streaming UsenetReader downloads.
+// Legacy mode (Aggressive=false) only honors MaxPrefetch as a segment window.
+// Aggressive mode fills toward HighWatermarkBytes while keeping up to
+// MaxInflight concurrent BodyPriority calls so the connection pool stays busy.
+type PrefetchConfig struct {
+	MaxPrefetch        int   // hard cap on segments scheduled ahead of the read cursor
+	Aggressive         bool  // enable byte-watermark + sustained inflight
+	HighWatermarkBytes int64 // pause scheduling when unread ahead reaches this
+	LowWatermarkBytes  int64 // resume after pausing when unread ahead falls below this
+	MaxInflight        int   // max concurrent segment downloads (0 = derive)
+}
+
+// WithPrefetchConfig applies watermark / aggressive prefetch settings.
+// MaxPrefetch on the config still wins if NewUsenetReader was given a lower
+// positive maxPrefetch argument (callers typically pass the same value both ways).
+func WithPrefetchConfig(p PrefetchConfig) ReaderOption {
+	return func(r *UsenetReader) {
+		if p.MaxPrefetch > 0 {
+			r.maxPrefetch = p.MaxPrefetch
+		}
+		r.aggressive = p.Aggressive
+		r.highWatermarkBytes = p.HighWatermarkBytes
+		r.lowWatermarkBytes = p.LowWatermarkBytes
+		r.maxInflight = p.MaxInflight
+	}
 }
 
 // WithImportProfile marks the reader as import-owned: segment fetches use the
@@ -128,6 +163,16 @@ type UsenetReader struct {
 
 	// Tracing counters (atomic, no lock needed)
 	inFlight atomic.Int32 // goroutines actively downloading right now
+
+	// Aggressive watermark mode (streaming). When aggressive is false, only
+	// maxPrefetch segment-count limiting applies (legacy).
+	aggressive         bool
+	highWatermarkBytes int64
+	lowWatermarkBytes  int64
+	maxInflight        int
+	// waitingForLowWatermark is set after we hit the high watermark so we
+	// don't resume until unread ahead drops below the low watermark (hysteresis).
+	waitingForLowWatermark bool
 
 	mu sync.Mutex
 }
@@ -556,6 +601,7 @@ func (b *UsenetReader) downloadManager(ctx context.Context) {
 	}
 
 	totalSegments := b.rg.Len()
+	maxInflight := b.effectiveMaxInflight()
 
 	for ctx.Err() == nil {
 		b.mu.Lock()
@@ -570,16 +616,86 @@ func (b *UsenetReader) downloadManager(ctx context.Context) {
 			break
 		}
 
-		// Limit how far ahead we prefetch beyond the current read position
 		currentRead := b.rg.GetCurrentIndex()
 		ahead := b.nextToDownload - currentRead
-		if ahead >= b.maxPrefetch {
+
+		// Segment-count cap bounds scheduled-ahead fan-out. In aggressive mode
+		// raise it so the byte watermark can actually fill (100 × ~750KB is
+		// only ~75MB — far below a 512MB watermark).
+		segmentCap := b.segmentAheadCap(maxInflight)
+		if ahead >= segmentCap {
 			b.cond.Wait()
 			b.mu.Unlock()
 			if ctx.Err() != nil {
 				return
 			}
 			continue
+		}
+
+		if b.aggressive && b.highWatermarkBytes > 0 {
+			aheadBytes := b.aheadBytesLocked(currentRead, b.nextToDownload)
+
+			if b.waitingForLowWatermark {
+				if aheadBytes > b.lowWatermarkBytes {
+					b.cond.Wait()
+					b.mu.Unlock()
+					if ctx.Err() != nil {
+						return
+					}
+					continue
+				}
+				b.waitingForLowWatermark = false
+			}
+
+			if aheadBytes >= b.highWatermarkBytes {
+				b.waitingForLowWatermark = true
+				b.cond.Wait()
+				b.mu.Unlock()
+				if ctx.Err() != nil {
+					return
+				}
+				continue
+			}
+
+			urgentEnd := b.urgentEndIndexLocked(currentRead, totalSegments)
+			inFlightNow := int(b.inFlight.Load())
+
+			// Deep fill (past the urgent near-cursor window) only after the
+			// urgent window is ready — otherwise seeks/playback starve while
+			// we saturate the pool downloading hundreds of MB ahead.
+			if b.nextToDownload >= urgentEnd {
+				if !b.urgentWindowReadyLocked(currentRead, urgentEnd) {
+					b.cond.Wait()
+					b.mu.Unlock()
+					if ctx.Err() != nil {
+						return
+					}
+					continue
+				}
+				// Deep prefetch uses a smaller concurrency budget.
+				deepLimit := maxInflight / 3
+				if deepLimit < 4 {
+					deepLimit = 4
+				}
+				if deepLimit > maxInflight {
+					deepLimit = maxInflight
+				}
+				if inFlightNow >= deepLimit {
+					b.cond.Wait()
+					b.mu.Unlock()
+					if ctx.Err() != nil {
+						return
+					}
+					continue
+				}
+			} else if inFlightNow >= maxInflight {
+				b.cond.Wait()
+				b.mu.Unlock()
+				if ctx.Err() != nil {
+					return
+				}
+				continue
+			}
 		}
 
 		// Schedule next segment for download
@@ -633,4 +749,103 @@ func (b *UsenetReader) downloadManager(ctx context.Context) {
 		}(idx, seg)
 	}
 
+}
+
+// effectiveMaxInflight returns the concurrent download cap for aggressive mode.
+func (b *UsenetReader) effectiveMaxInflight() int {
+	if b.maxInflight > 0 {
+		return b.maxInflight
+	}
+	if b.aggressive {
+		return defaultAggressiveMaxInflight
+	}
+	return b.maxPrefetch
+}
+
+// segmentAheadCap is how many segments may be scheduled ahead of the read
+// cursor. Legacy mode uses maxPrefetch; aggressive mode expands the cap so
+// the RAM watermark can fill.
+func (b *UsenetReader) segmentAheadCap(maxInflight int) int {
+	capN := b.maxPrefetch
+	if capN <= 0 {
+		capN = defaultMaxPrefetch
+	}
+	if !b.aggressive || b.highWatermarkBytes <= 0 {
+		return capN
+	}
+	// Conservative article size so we never under-allocate the segment window.
+	const minSegBytes int64 = 512 * 1024
+	needed := int(b.highWatermarkBytes/minSegBytes) + maxInflight + 8
+	if needed > capN {
+		return needed
+	}
+	return capN
+}
+
+// aheadBytesLocked sums SegmentSize for segments in [from, to). Caller must
+// hold b.mu. Used for watermark decisions; SegmentSize is the physical article
+// size (~750KB) and is available before the download completes.
+func (b *UsenetReader) aheadBytesLocked(from, to int) int64 {
+	if b.rg == nil || to <= from {
+		return 0
+	}
+	var total int64
+	for i := from; i < to; i++ {
+		seg, err := b.rg.GetSegment(i)
+		if err != nil || seg == nil {
+			continue
+		}
+		if seg.SegmentSize > 0 {
+			total += seg.SegmentSize
+		} else {
+			// Fallback: usable slice length when physical size unknown.
+			total += seg.End - seg.Start + 1
+		}
+	}
+	return total
+}
+
+// urgentEndIndexLocked returns the exclusive segment index that covers
+// urgentAheadBytes from the current read cursor.
+func (b *UsenetReader) urgentEndIndexLocked(currentRead, totalSegments int) int {
+	if b.rg == nil || currentRead >= totalSegments {
+		return currentRead
+	}
+	var accum int64
+	end := currentRead
+	for end < totalSegments && accum < urgentAheadBytes {
+		seg, err := b.rg.GetSegment(end)
+		if err != nil || seg == nil {
+			end++
+			continue
+		}
+		if seg.SegmentSize > 0 {
+			accum += seg.SegmentSize
+		} else {
+			accum += seg.End - seg.Start + 1
+		}
+		end++
+	}
+	if end <= currentRead {
+		return currentRead + 1
+	}
+	return end
+}
+
+// urgentWindowReadyLocked is true when every segment in [from, to) has finished
+// downloading (success or error). Caller holds b.mu.
+func (b *UsenetReader) urgentWindowReadyLocked(from, to int) bool {
+	if b.rg == nil || to <= from {
+		return true
+	}
+	for i := from; i < to; i++ {
+		seg, err := b.rg.GetSegment(i)
+		if err != nil || seg == nil {
+			return false
+		}
+		if !seg.IsReady() {
+			return false
+		}
+	}
+	return true
 }

@@ -276,3 +276,30 @@ func TestImportBudget_CapacitySnapshot(t *testing.T) {
 		t.Fatalf("Capacity() = %d, want 0 after negative set", got)
 	}
 }
+
+func TestImportBudget_PauseImportsWhileStreaming(t *testing.T) {
+	src := &stubStreamSource{}
+	b := NewImportBudget()
+	b.SetStreamSource(src)
+	b.SetCapacity(8)
+	b.SetPauseImportsWhileStreaming(true)
+
+	src.set(1)
+	b.NotifyStreamChange()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	_, err := b.Acquire(ctx)
+	if err == nil {
+		t.Fatal("Acquire should block/fail while streams active and pause enabled")
+	}
+
+	// Clear streams — Acquire should succeed.
+	src.set(0)
+	b.NotifyStreamChange()
+	r, err := b.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("Acquire after streams ended: %v", err)
+	}
+	r()
+}

@@ -12,7 +12,10 @@ func RegisterConfigHandlers(ctx context.Context, configManager *config.Manager, 
 	// Initial ID mapping
 	updateProviderIDMap(configManager.GetConfig(), poolManager)
 	// Initial import connection budget: the pool's total connection capacity.
-	poolManager.SetImportConnCapacity(configManager.GetConfig().TotalProviderConnections())
+	initial := configManager.GetConfig()
+	poolManager.SetImportConnCapacity(initial.TotalProviderConnections())
+	pauseImports := initial.Streaming.PauseImportsWhileStreaming != nil && *initial.Streaming.PauseImportsWhileStreaming
+	poolManager.SetPauseImportsWhileStreaming(pauseImports)
 
 	configManager.OnConfigChange(func(oldConfig, newConfig *config.Config) {
 		slog.InfoContext(ctx, "Configuration updated")
@@ -24,6 +27,13 @@ func RegisterConfigHandlers(ctx context.Context, configManager *config.Manager, 
 		if capacity := newConfig.TotalProviderConnections(); capacity != oldConfig.TotalProviderConnections() {
 			slog.InfoContext(ctx, "Import connection budget updated", "capacity", capacity)
 			poolManager.SetImportConnCapacity(capacity)
+		}
+
+		oldPause := oldConfig.Streaming.PauseImportsWhileStreaming != nil && *oldConfig.Streaming.PauseImportsWhileStreaming
+		newPause := newConfig.Streaming.PauseImportsWhileStreaming != nil && *newConfig.Streaming.PauseImportsWhileStreaming
+		if oldPause != newPause {
+			slog.InfoContext(ctx, "Pause imports while streaming updated", "enabled", newPause)
+			poolManager.SetPauseImportsWhileStreaming(newPause)
 		}
 
 		// Log changes that still require restart

@@ -310,9 +310,19 @@ func setupAPIServer(
 // source. Returns the manager so the caller can defer Stop(). Returns nil if CachePath
 // is not configured (enabled/disabled is checked at read-time via source.Store()).
 func initializeSegmentCache(ctx context.Context, cfg *config.Config, source *segcache.Source) *segcache.Manager {
-	if cfg.SegmentCache.CachePath == "" {
-		slog.InfoContext(ctx, "Segment cache not configured (no cache_path set)")
-		return nil
+	cachePath := cfg.SegmentCache.CachePath
+	if cachePath == "" {
+		// Enabled-with-empty-path used to silently no-op; default to the
+		// documented path so toggling "Enable Segment Cache" in the UI works
+		// without a mandatory path field.
+		if cfg.SegmentCache.Enabled != nil && *cfg.SegmentCache.Enabled {
+			cachePath = "/tmp/altmount-segcache"
+			slog.InfoContext(ctx, "Segment cache enabled with empty path; using default",
+				"cache_path", cachePath)
+		} else {
+			slog.InfoContext(ctx, "Segment cache not configured (no cache_path set)")
+			return nil
+		}
 	}
 
 	// ExpiryHours is normalized in config.Validate (nil -> 24h); guard against
@@ -324,7 +334,7 @@ func initializeSegmentCache(ctx context.Context, cfg *config.Config, source *seg
 	}
 
 	mgrCfg := segcache.ManagerConfig{
-		CachePath:      cfg.SegmentCache.CachePath,
+		CachePath:      cachePath,
 		MaxSizeBytes:   int64(cfg.SegmentCache.MaxSizeGB) * 1024 * 1024 * 1024,
 		ExpiryDuration: time.Duration(expiryHours) * time.Hour,
 	}.WithDefaults()

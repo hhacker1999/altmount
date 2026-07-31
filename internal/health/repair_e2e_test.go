@@ -55,6 +55,7 @@ func (m *mockPoolManager) SetImportConnCapacity(_ int)                 {}
 func (m *mockPoolManager) ImportConnCapacity() int                     { return 0 }
 func (m *mockPoolManager) SetStreamSource(_ pool.StreamActivitySource) {}
 func (m *mockPoolManager) NotifyStreamChange()                         {}
+func (m *mockPoolManager) SetPauseImportsWhileStreaming(bool) {}
 
 // mockARRsService captures TriggerFileRescan calls and returns a configurable error.
 type mockARRsService struct {

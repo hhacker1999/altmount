@@ -99,6 +99,40 @@ func (mrf *MetadataRemoteFile) getMaxPrefetch() int {
 	return mrf.configGetter().Streaming.MaxPrefetch
 }
 
+// streamingPrefetchConfig builds usenet.PrefetchConfig from the current
+// streaming section. Used when opening UsenetReaders for media playback.
+// cfg may be nil (tests); then only MaxPrefetch is applied (legacy mode).
+func streamingPrefetchConfig(cfg *config.Config, maxPrefetch int) usenet.PrefetchConfig {
+	pc := usenet.PrefetchConfig{MaxPrefetch: maxPrefetch}
+	if cfg == nil {
+		return pc
+	}
+	sc := cfg.Streaming
+	pc.Aggressive = sc.AggressiveStreaming != nil && *sc.AggressiveStreaming
+	highMB := sc.PrefetchWatermarkMB
+	if highMB <= 0 {
+		highMB = 256
+	}
+	lowMB := sc.PrefetchLowWatermarkMB
+	if lowMB <= 0 {
+		lowMB = highMB / 2
+	}
+	pc.HighWatermarkBytes = int64(highMB) * 1024 * 1024
+	pc.LowWatermarkBytes = int64(lowMB) * 1024 * 1024
+	pc.MaxInflight = sc.MaxInflightSegments
+	return pc
+}
+
+// prefetchConfigForReader resolves streaming prefetch settings for a virtual
+// file. Safe when configGetter is nil (unit tests).
+func (mvf *MetadataVirtualFile) prefetchConfigForReader() usenet.PrefetchConfig {
+	var cfg *config.Config
+	if mvf.configGetter != nil {
+		cfg = mvf.configGetter()
+	}
+	return streamingPrefetchConfig(cfg, mvf.maxPrefetch)
+}
+
 // resolveSegmentStore returns the active SegmentStore for a new reader, or nil if
 // the cache is disabled or not configured. Called once per file-open.
 func (mrf *MetadataRemoteFile) resolveSegmentStore() usenet.SegmentStore {
@@ -288,6 +322,23 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 		streamTracker:    mrf.streamTracker,
 		streamID:         streamID,
 		segmentStore:     mrf.resolveSegmentStore(),
+	}
+
+	// Align handle position with the HTTP Range start immediately so the
+	// stream tracker and first ensureReader agree with the client's cursor
+	// even before ServeContent's Seek.
+	if rangeStr, ok := ctx.Value(utils.RangeKey).(string); ok && rangeStr != "" {
+		if rh, err := utils.ParseRangeHeader(rangeStr); err == nil && rh != nil && rh.Start >= 0 {
+			if rh.Start < fileMeta.FileSize {
+				virtualFile.position = rh.Start
+				virtualFile.readAtSharedNext = rh.Start
+			}
+			virtualFile.originalRangeEnd = rh.End
+			virtualFile.httpRangeConsumed = true
+			if streamID != "" && mrf.streamTracker != nil {
+				mrf.streamTracker.UpdateCurrentOffset(streamID, virtualFile.position)
+			}
+		}
 	}
 
 	return true, virtualFile, nil
@@ -824,6 +875,12 @@ type MetadataVirtualFile struct {
 	readerInitialized bool
 	position          int64 // File position (what client sees after Seek)
 	originalRangeEnd  int64 // Original end requested by client (-1 for unbounded)
+	// httpRangeConsumed is true once the HTTP Range header from ctx has been
+	// applied (or determined absent). After a Seek we must NOT re-apply that
+	// header — doing so rewound the reader to the original Range start and
+	// made playback/seek appear stuck at the old cursor while NNTP still
+	// saturated downloading the wrong region.
+	httpRangeConsumed bool
 
 	// readAtSharedNext is the next file offset that the shared reader can serve
 	// via ReadAtContext. Sequential ReadAt calls reuse mvf.reader when the
@@ -1464,17 +1521,22 @@ func (mvf *MetadataVirtualFile) Seek(offset int64, whence int) (int64, error) {
 
 	// Close reader if position changes - UsenetReader is forward-only and cannot seek.
 	// Creating a new reader at the target position is faster than downloading and
-	// discarding data to catch up.
+	// discarding data to catch up. Interrupt cancels in-flight NNTP immediately so
+	// aggressive prefetch at the old cursor cannot starve the new position.
 	if mvf.readerInitialized && abs != mvf.position {
 		mvf.closeCurrentReader()
 	}
 
-	// Reset originalRangeEnd when position changes to force fresh range calculation
-	// on next read. This prevents stale range information from being reused after seek.
 	if abs != mvf.position {
-		mvf.originalRangeEnd = 0
+		// Continue from the seek target unbounded. Never re-apply the original
+		// HTTP Range start — that rewound readers to the request's initial
+		// offset after every Seek (playback cursor looked stuck).
+		mvf.originalRangeEnd = -1
+		mvf.httpRangeConsumed = true
 		if mvf.streamTracker != nil && mvf.streamID != "" {
 			mvf.streamTracker.UpdateCurrentOffset(mvf.streamID, abs)
+			// Buffered offset is invalid until the new reader reports progress.
+			mvf.streamTracker.UpdateBufferedOffset(mvf.streamID, abs)
 		}
 	}
 
@@ -1734,32 +1796,35 @@ func (mvf *MetadataVirtualFile) ensureReader() error {
 	return nil
 }
 
-// getRequestRange gets the range for reader creation based on HTTP range or current position
-// Implements intelligent range limiting to prevent excessive memory usage when end=-1 or ranges are too large
+// getRequestRange gets the range for reader creation based on HTTP range or current position.
+// The HTTP Range header is applied at most once per handle (OpenFile may have
+// already consumed it). After Seek, readers always start at mvf.position.
 func (mvf *MetadataVirtualFile) getRequestRange() (start, end int64) {
-	// If this is the first read, check for HTTP range header and save original end
-	if !mvf.readerInitialized && mvf.originalRangeEnd == 0 {
-		// Extract range from context
+	if !mvf.httpRangeConsumed {
+		mvf.httpRangeConsumed = true
 		if rangeStr, ok := mvf.ctx.Value(utils.RangeKey).(string); ok && rangeStr != "" {
 			rangeHeader, err := utils.ParseRangeHeader(rangeStr)
 			if err == nil && rangeHeader != nil {
 				mvf.originalRangeEnd = rangeHeader.End
+				// Prefer the handle position when Seek/OpenFile already moved it.
+				if mvf.position > 0 && mvf.position != rangeHeader.Start {
+					return mvf.position, rangeHeader.End
+				}
+				if rangeHeader.Start >= 0 {
+					mvf.position = rangeHeader.Start
+				}
 				return rangeHeader.Start, rangeHeader.End
 			}
 		}
-
-		// No range header, set unbounded
+		// No range header — unbounded from current position.
 		mvf.originalRangeEnd = -1
 		return mvf.position, -1
 	}
 
-	// For subsequent reads, use current position and respect original range
 	var targetEnd int64
 	if mvf.originalRangeEnd == -1 {
-		// Original was unbounded, continue unbounded
 		targetEnd = -1
 	} else {
-		// Original had an end, respect it
 		targetEnd = mvf.originalRangeEnd
 	}
 
@@ -1818,7 +1883,9 @@ func (mvf *MetadataVirtualFile) createUsenetReader(ctx context.Context, start, e
 	// for eligible video files (nil for everything else — reads fail as
 	// always). See holes.go.
 	ur, err := usenet.NewUsenetReader(ctx, mvf.poolManager.GetPool, rg, mvf.maxPrefetch, mvf.streamTracker, mvf.streamID, mvf.segmentStore,
-		usenet.WithHoleHooks(mvf.holeHooks()))
+		usenet.WithHoleHooks(mvf.holeHooks()),
+		usenet.WithPrefetchConfig(mvf.prefetchConfigForReader()),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -1946,7 +2013,9 @@ func (mvf *MetadataVirtualFile) createUsenetReaderFromSegments(ctx context.Conte
 		return nil, fmt.Errorf("no segments cover range [%d, %d]", start, end)
 	}
 
-	ur, err := usenet.NewUsenetReader(ctx, mvf.poolManager.GetPool, rg, mvf.maxPrefetch, mvf.streamTracker, mvf.streamID, mvf.segmentStore)
+	ur, err := usenet.NewUsenetReader(ctx, mvf.poolManager.GetPool, rg, mvf.maxPrefetch, mvf.streamTracker, mvf.streamID, mvf.segmentStore,
+		usenet.WithPrefetchConfig(mvf.prefetchConfigForReader()),
+	)
 	if err != nil {
 		return nil, err
 	}

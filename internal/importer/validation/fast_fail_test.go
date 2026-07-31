@@ -46,6 +46,7 @@ func (m fastFailPoolManager) SetImportConnCapacity(int)                 {}
 func (m fastFailPoolManager) ImportConnCapacity() int                   { return 0 }
 func (m fastFailPoolManager) SetStreamSource(pool.StreamActivitySource) {}
 func (m fastFailPoolManager) NotifyStreamChange()                       {}
+func (m fastFailPoolManager) SetPauseImportsWhileStreaming(bool) {}
 
 func TestFastFailReleaseProbeUsesSegmentSamplePercentage(t *testing.T) {
 	client := fakepool.New()
